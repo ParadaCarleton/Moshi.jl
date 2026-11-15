@@ -63,6 +63,9 @@ const REACH = Mode(true, true)
 "Mode for earlier arms: only values they surely accept."
 const COVER = Mode(false, false)
 
+"Mode for exhaustiveness, as in Rust: unreadable parts match every value; tests match none."
+const EXHAUST = Mode(true, false)
+
 unreadable(mode::Mode)::Space = mode.widen ? ANY : NO_VALUE
 
 "The `@data` type of `variant`, without type parameters."
@@ -162,6 +165,17 @@ function minus(budget::Budget, left::Ctor, right::Ctor)::Space
     return alt(budget, terms)
 end
 
+"Direct subpatterns of `pat`, held in its fields directly or in vectors and dicts."
+function children(pat::Pattern.Type)::Vector{Pattern.Type}
+    out = Pattern.Type[]
+    for name in Data.variant_fieldnames(pat)
+        field = getproperty(pat, name)
+        items = field isa Union{AbstractVector,AbstractDict} ? values(field) : (field,)
+        append!(out, Iterators.filter(item -> item isa Pattern.Type, items))
+    end
+    return out
+end
+
 """
 One arm as `lower!` reads it: the mode, the step budget, and the names bound so far in the
 current branch of `||`. A name bound again tests equality.
@@ -191,13 +205,47 @@ function branches!(f, reading::Reading, pat::Pattern.Type)::Tuple
     return results
 end
 
+"""
+True when `pat` holds a guard or repeats a name. `reading` gains the names `pat` binds
+before its first test.
+"""
+tested!(reading::Reading, pat::Pattern.Type)::Bool =
+    tested!(reading, variant_type(pat), pat)
+function tested!(reading::Reading, ::Type, pat::Pattern.Type)
+    return any(child -> tested!(reading, child), children(pat))
+end
+tested!(reading::Reading, ::Type{Pattern.Guard}, pat::Pattern.Type) = true
+function tested!(reading::Reading, ::Type{Pattern.Variable}, pat::Pattern.Type)
+    return bind!(reading, pat.:1)
+end
+function tested!(reading::Reading, ::Type{Pattern.Or}, pat::Pattern.Type)
+    return any(branches!(tested!, reading, pat))
+end
+
+"Add to `out` the variants `pat` names for the matched value itself, outside its fields."
+top_variants!(out::Vector{Type}, pat::Pattern.Type)::Vector{Type} =
+    top_variants!(out, variant_type(pat), pat)
+top_variants!(out::Vector{Type}, ::Type, pat::Pattern.Type) = out
+function top_variants!(out::Vector{Type}, ::Type{Pattern.Call}, pat::Pattern.Type)
+    return Data.is_variant_type(pat.head) ? push!(out, pat.head) : out
+end
+function top_variants!(
+    out::Vector{Type}, ::Type{<:Union{Pattern.And,Pattern.Or}}, pat::Pattern.Type
+)
+    top_variants!(out, pat.:1)
+    return top_variants!(out, pat.:2)
+end
+function top_variants!(out::Vector{Type}, ::Type{Pattern.TypeAnnotate}, pat::Pattern.Type)
+    return top_variants!(out, pat.body)
+end
+
 "Space of values `pat` accepts, read in `mode`."
 lower(pat::Pattern.Type, mode::Mode, budget::Budget)::Space =
     lower!(Reading(mode, budget, Set{Symbol}()), pat)
 
 "Space of values `pat` accepts; `reading` gains the names `pat` binds."
 lower!(reading::Reading, pat::Pattern.Type)::Space = lower!(reading, variant_type(pat), pat)
-lower!(reading::Reading, ::Type, pat::Pattern.Type) = unreadable(reading.mode)
+lower!(reading::Reading, ::Type, pat::Pattern.Type) = lower_unreadable!(reading, pat)
 lower!(reading::Reading, ::Type{Pattern.Wildcard}, pat::Pattern.Type) = ANY
 function lower!(reading::Reading, ::Type{Pattern.Variable}, pat::Pattern.Type)
     return bind!(reading, pat.:1) && !reading.mode.tests_pass ? NO_VALUE : ANY
@@ -216,12 +264,12 @@ function lower!(reading::Reading, ::Type{Pattern.TypeAnnotate}, pat::Pattern.Typ
     return both(reading.budget, lower!(reading, pat.body), unreadable(reading.mode))
 end
 function lower!(reading::Reading, ::Type{Pattern.Call}, pat::Pattern.Type)
-    Data.is_variant_type(pat.head) || return unreadable(reading.mode)
+    Data.is_variant_type(pat.head) || return lower_unreadable!(reading, pat)
     variant = Base.typename(Base.unwrap_unionall(pat.head)).wrapper
     # explicit type parameters (`Opt.Some{Int}`) match only part of the variant
     variant === pat.head || reading.mode.widen || return NO_VALUE
     fieldnames = Data.variant_fieldnames(variant)
-    all(in(fieldnames), keys(pat.kwargs)) || return unreadable(reading.mode)
+    all(in(fieldnames), keys(pat.kwargs)) || return lower_unreadable!(reading, pat)
     fields = Space[ANY for _ in 1:Data.variant_nfields(variant)]
     for (idx, arg) in enumerate(pat.args)
         fields[idx] = lower!(reading, arg)
@@ -231,6 +279,12 @@ function lower!(reading::Reading, ::Type{Pattern.Call}, pat::Pattern.Type)
         fields[idx] = both(reading.budget, fields[idx], lower!(reading, arg))
     end
     return ctor(variant, fields)
+end
+
+"Space of an unreadable pattern; a test inside it still counts."
+function lower_unreadable!(reading::Reading, pat::Pattern.Type)::Space
+    tested!(reading, pat) && !reading.mode.tests_pass && return NO_VALUE
+    return unreadable(reading.mode)
 end
 
 """
@@ -247,18 +301,84 @@ function unreachable_arms(cases::Vector{Pattern.Type}, budget::Budget)::Vector{I
     return dead
 end
 
+"""
+Up to `limit` patterns, each matching only values in `space`. If a position in `space`
+excludes variants, its examples are the other variants of their `@data` type. If the
+excluded variants come from several types, the position has no examples.
+"""
+function examples(space::Alt, limit::Int)::Vector{Space}
+    found = Space[]
+    for member in space.alts
+        length(found) < limit || break
+        append!(found, examples(member, limit - length(found)))
+    end
+    return found
+end
+function examples(space::Ctor, limit::Int)::Vector{Space}
+    choices = [examples(field, limit) for field in space.fields]
+    combos = Iterators.take(Iterators.product(choices...), limit)
+    return Space[Ctor(space.variant, collect(Space, combo)) for combo in combos]
+end
+function examples(space::Wild, limit::Int)::Vector{Space}
+    isempty(space.excluded) && return Space[ANY]
+    adts = unique(Type[adt(variant) for variant in space.excluded])
+    length(adts) == 1 || return Space[]
+    variants = [variant for variant in Data.variants(only(adts)) if admits(space, variant)]
+    return Space[
+        Ctor(variant, Space[ANY for _ in 1:Data.variant_nfields(variant)]) for
+        variant in first(variants, limit)
+    ]
+end
+
+"""
+Up to `limit` patterns no arm surely matches. Empty unless the arms name variants of
+exactly one `@data` type. Throws `OutOfSteps` when `budget` runs out.
+"""
+function missing_patterns(
+    cases::Vector{Pattern.Type}, limit::Int, budget::Budget
+)::Vector{Space}
+    variants = foldl(top_variants!, cases; init=Type[])
+    adts = unique(Type[adt(variant) for variant in variants])
+    length(adts) == 1 || return Space[]
+    unmatched = alt(budget, (full(variant) for variant in Data.variants(only(adts))))
+    for case in cases
+        unmatched = minus(budget, unmatched, lower(case, EXHAUST, budget))
+    end
+    return examples(unmatched, limit)
+end
+
+"Path of the `@data` module of `variant`, short when `scope` binds that module by name."
+function data_path(variant::Type, scope::Module)::String
+    data = parentmodule(adt(variant))
+    name = nameof(data)
+    isdefined(scope, name) && getfield(scope, name) === data && return string(name)
+    return join(fullname(data), ".")
+end
+
+"`space` as pattern code that compiles in `scope`."
+show_space(::Wild, scope::Module)::String = "_"
+function show_space(space::Ctor, scope::Module)::String
+    name = string(data_path(space.variant, scope), ".", Data.variant_name(space.variant))
+    return string(name, "(", join(show_space.(space.fields, Ref(scope)), ", "), ")")
+end
+
 "Steps one check may take before it stops."
 const BUDGET = 100_000
 
-"""
-Warn, at macro expansion, about unreachable arms.
+"Number of missing patterns one warning names."
+const SHOWN = 3
 
-The check assumes only declared field types, so a final `_` arm stays reachable. As in
-Rust, a guard or a repeated name covers nothing, since its test can fail. Unreadable parts
-(the type in a type annotation, parametrized variant heads, interpolated values, custom call
-patterns) match every value in the arm under check and no value in earlier arms. Each
-warning is therefore certain. Some unreachable arms behind unreadable parts go unreported.
-After `budget` steps, the check stops with a warning.
+"""
+Warn, at macro expansion, about unreachable arms and values no arm matches.
+
+Exhaustiveness needs arms that name variants of one `@data` type, and assumes the value has
+that type. Reachability assumes only declared field types, so a final `_` arm stays
+reachable. As in Rust, a guard or a repeated name covers nothing, since its test can fail.
+Unreadable parts (the type in a type annotation, parametrized variant heads, interpolated
+values, custom call patterns) never make a later arm unreachable. For exhaustiveness, they
+match every value. Each unreachable-arm warning is certain. A non-exhaustive warning can
+name values that only guarded arms match. Some mistakes behind unreadable parts go
+unreported. After `budget` steps, a check stops with a warning.
 """
 function verify(info, budget::Int=BUDGET)
     any(case -> isa_variant(case, Pattern.Err), info.cases) && return nothing
@@ -268,9 +388,15 @@ function verify(info, budget::Int=BUDGET)
             @warn "unreachable match arm: earlier arms already match every value it accepts" _module =
                 info.mod _file = line_file(line) _line = line_number(line)
         end
+        patterns = missing_patterns(info.cases, SHOWN + 1, Budget(budget))
+        isempty(patterns) && return nothing
+        shown = join(("`$(show_space(p, info.mod))`" for p in first(patterns, SHOWN)), ", ")
+        more = length(patterns) > SHOWN ? " and more" : ""
+        @warn "non-exhaustive match: no arm matches $shown$more; add matching arms or a `_` arm" _module =
+            info.mod _file = line_file(info.source) _line = line_number(info.source)
     catch err
         err isa OutOfSteps || rethrow()
-        @warn "match too complex to check: stopped after $budget steps; unreachable arms may go unreported" _module =
+        @warn "match too complex to check: stopped after $budget steps; unreachable arms and missing patterns may go unreported" _module =
             info.mod _file = line_file(info.source) _line = line_number(info.source)
     end
     return nothing
