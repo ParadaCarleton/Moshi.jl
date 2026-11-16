@@ -7,7 +7,58 @@ function _is_doc_macro(head)
     return false
 end
 
+"""
+    order_chain(expr)
+
+Operator (`:<` or `:>`) and operands of an order chain such as `A() < B() < C()`;
+`nothing` when `expr` is not an order chain.
+"""
+function order_chain(expr)
+    if Meta.isexpr(expr, :call) && length(expr.args) == 3 && expr.args[1] in (:<, :>)
+        return expr.args[1], expr.args[2:3]
+    elseif Meta.isexpr(expr, :comparison)
+        operators = expr.args[2:2:end]
+        all(in((:<, :>)), operators) && allequal(operators) || throw(
+            ArgumentError(
+                "invalid order chain `$expr`: use only `<` (smallest first) or only `>` (largest first)",
+            ),
+        )
+        return first(operators), expr.args[1:2:end]
+    end
+    return nothing
+end
+
+"""
+    push_ordered!(variants, operator, operands, source)
+
+Push the singleton variants of an order chain in source order; return their names from
+smallest to largest.
+"""
+function push_ordered!(variants::Vector{Variant}, operator::Symbol, operands, source)
+    names = map(operands) do operand
+        Meta.isexpr(operand, :call) &&
+            length(operand.args) == 1 &&
+            operand.args[1] isa Symbol || throw(
+            ArgumentError(
+                "invalid order chain operand `$operand`: an order chain holds singleton variants only, written `Name()`",
+            ),
+        )
+        return operand.args[1]
+    end
+    allunique(names) ||
+        throw(ArgumentError("invalid order chain: it names a variant more than once"))
+    for name in names
+        push!(variants, Variant(Singleton, name, nothing, nothing, source))
+    end
+    return operator === :< ? names : reverse(names)
+end
+
 function push_variants!(variants::Vector{Variant}, expr, doc, source)
+    isnothing(order_chain(expr)) || throw(
+        ArgumentError(
+            "order chain `$expr` must stand alone in the `@data` body, without `@doc` or `begin ... end`",
+        ),
+    )
     if Meta.isexpr(expr, :macrocall) && _is_doc_macro(expr.args[1])
         non_lnn = filter(a -> !(a isa LineNumberNode), expr.args)
         length(non_lnn) == 3 || throw(
@@ -49,6 +100,7 @@ function TypeDef(
         throw(ArgumentError("expect begin ... end block, got $body"))
     variants = Variant[]
     exports = Symbol[]
+    order = nothing
     current_line = nothing
     for expr in body.args
         if expr isa LineNumberNode
@@ -60,10 +112,33 @@ function TypeDef(
             push_exports!(exports, expr)
             continue
         end
-        push_variants!(variants, expr, nothing, current_line)
+        chain = order_chain(expr)
+        if isnothing(chain)
+            push_variants!(variants, expr, nothing, current_line)
+        else
+            isnothing(order) || throw(
+                ArgumentError("`$(head.name)` has more than one order chain; use one")
+            )
+            order = push_ordered!(variants, chain..., current_line)
+        end
     end
+    validate_order(head, ismutable, variants, order)
     validate_exports(head, variants, exports)
-    return TypeDef(mod, ismutable, head, variants, exports, source)
+    return TypeDef(mod, ismutable, head, variants, exports, source, order)
+end
+
+function validate_order(
+    head::TypeHead, ismutable::Bool, variants::Vector{Variant}, order::Maybe{Vector{Symbol}}
+)
+    isnothing(order) && return nothing
+    length(order) == length(variants) || throw(
+        ArgumentError(
+            "the order chain of `$(head.name)` must name every variant; declare all variants in the chain",
+        ),
+    )
+    ismutable &&
+        throw(ArgumentError("ordered `@data` type `$(head.name)` cannot be mutable"))
+    return nothing
 end
 
 function push_exports!(exports::Vector{Symbol}, expr::Expr)

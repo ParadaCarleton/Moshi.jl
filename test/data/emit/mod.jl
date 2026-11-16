@@ -6,6 +6,7 @@ using Test
     include("selfref.jl")
     include("empty_struct.jl")
     include("export.jl")
+    include("order.jl")
 end
 
 @testset "generic" begin

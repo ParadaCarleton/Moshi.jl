@@ -62,9 +62,10 @@ The syntax is as follows:
 ```julia
 <data> := @data <ident> [ <supertype> ] begin
     [ <export> ]
-    <variant>+
+    <variant>+ | <order>
 end
 <export> := export <ident> ( , <ident> )*
+<order> := <singleton> ( < <singleton> )+ | <singleton> ( > <singleton> )+
 <variant> := <singleton> | <anonymous> | <named>
 <singleton> := <ident> ( )
 <anonymous> := <ident> ( <type>+ )
@@ -209,6 +210,30 @@ Writing `SExpr.Type[]` explicitly is equivalent. See
 [issue #33](https://github.com/Roger-luo/Moshi.jl/issues/33).
 
 </Aside>
+
+## Ordered Variants
+
+To give the variants a total order, declare them in one chain of `<` (smallest first) or `>` (largest first):
+
+```julia
+@data Tier begin
+    Safe() < Likely() < Breaking() < Manual()
+end
+
+Tier.Safe() < Tier.Breaking()              # true
+max(Tier.Likely(), Tier.Manual())          # Tier.Manual()
+sort([Tier.Manual(), Tier.Safe()])         # [Tier.Safe(), Tier.Manual()]
+```
+
+The chain defines `Base.isless`, so `<`, `max`, `sort` and other ordered operations follow it. No `@derive` is needed.
+
+- The chain names every variant of the type, so the order is total.
+- Every variant in the chain is a singleton: `Name()`.
+- One chain uses one operator; `A() < B() > C()` is an error.
+- An ordered type cannot be `mutable`.
+- `variants` lists variants in source order.
+
+Use an ordered type in place of `Base.@enum` when the order means something, such as severity levels or pipeline stages. Unlike `@enum`, a `@match` on it can be checked for missing variants.
 
 ## Exporting Variants
 

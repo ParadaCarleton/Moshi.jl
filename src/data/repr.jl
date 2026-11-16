@@ -87,4 +87,5 @@ struct TypeDef
     variants::Vector{Variant}
     exports::Vector{Symbol} # variant names to `export` (rest are only `public`)
     source::LineNumberNode
+    order::Maybe{Vector{Symbol}} # variant names from smallest to largest; `nothing` when unordered
 end
